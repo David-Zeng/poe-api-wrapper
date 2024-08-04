@@ -7,3 +7,4 @@ playground/
 examples/
 langchain/
 Dockerfile
+poe_api_wrapper/openai/secrets.json
