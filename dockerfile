@@ -1,5 +1,5 @@
 # Use a 64-bit ARM base image
-FROM arm64v8/python:3.9-slim-buster
+FROM --platform=linux/arm64 python:3.11-slim
 
 # Set working directory
 WORKDIR /app

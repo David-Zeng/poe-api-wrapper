@@ -57,7 +57,7 @@ Twisted==24.7.0
 txaio==23.1.1
 typing_extensions==4.12.2
 urllib3==2.2.2
+websocket==0.2.1
 websocket-client==1.8.0
 zope.event==5.0
 zope.interface==7.0.1
-
