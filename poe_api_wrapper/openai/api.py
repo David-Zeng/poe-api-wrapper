@@ -6,16 +6,23 @@ from typing import Any, Union, AsyncGenerator
 import orjson, asyncio, random, os, uuid
 from httpx import AsyncClient
 
-
 import os
 import sys
 
+# __file__ = "/Users/davidzeng/git_repo/poe_api/submodules/poe-api-wrapper/poe_api_wrapper/openai/api.py"
 current_dir = os.path.dirname(os.path.abspath(__file__))
 print(current_dir)
 root_dir = os.path.dirname(os.path.dirname(current_dir))
 print(root_dir)
+poe_api_wrapper_dir = os.path.join(root_dir, "poe_api_wrapper")
+print(poe_api_wrapper_dir)
+openai_dir = os.path.join(root_dir, "poe_api_wrapper", "openai")
+print(openai_dir)
 
 sys.path.append(root_dir)
+sys.path.append(current_dir)
+sys.path.append(poe_api_wrapper_dir)
+sys.path.append(openai_dir)
 
 from poe_api_wrapper import AsyncPoeApi
 from poe_api_wrapper.openai import helpers
