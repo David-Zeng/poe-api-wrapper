@@ -32,5 +32,5 @@ EXPOSE 9000
 # Run the application
 CMD ["python", "./poe_api_wrapper/openai/api.py"]
 
-# docker build -f dockerfile -t poe_api_image .  
+# docker build -f dockerfile -t poe_api_image .
 # docker run -p 9000:9000 -d --name poe_api_app poe_api_image
