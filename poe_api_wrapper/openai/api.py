@@ -2,9 +2,9 @@ from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import StreamingResponse, ORJSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from daphne.cli import CommandLineInterface
-from typing import Any, Union, AsyncGenerator
 import orjson, asyncio, random, os, uuid
 from httpx import AsyncClient
+from typing import Any, Dict, Tuple, Union, AsyncGenerator
 
 import os
 import sys
@@ -585,7 +585,7 @@ async def image_handler(baseModel: str, prompt: str, tokensLimit: int) -> dict:
 
 
 async def message_handler(
-    baseModel: str, messages: list[dict[str, str]], tokensLimit: int
+    baseModel: str, messages: List[Dict[str, str]], tokensLimit: int
 ) -> dict:
 
     try:
@@ -646,7 +646,7 @@ async def create_completion_data(
     include_usage: bool = False,
     prompt_tokens: int = 0,
     completion_tokens: int = 0,
-) -> dict[str, Union[str, list, float]]:
+) -> Dict[str, Union[str, list, float]]:
 
     completion_timestamp = await helpers.__generate_timestamp()
 
@@ -682,7 +682,7 @@ async def generate_chunks(
     model: str,
     completion_id: str,
     prompt_tokens: int,
-    image_urls: list[str],
+    image_urls: List[str],
     max_tokens: int,
     include_usage: bool,
 ) -> AsyncGenerator[bytes, None]:
@@ -742,7 +742,7 @@ async def streaming_response(
     model: str,
     completion_id: str,
     prompt_tokens: int,
-    image_urls: list[str],
+    image_urls: List[str],
     max_tokens: int,
     include_usage: bool,
 ) -> StreamingResponse:
@@ -772,7 +772,7 @@ async def non_streaming_response(
     model: str,
     completion_id: str,
     prompt_tokens: int,
-    image_urls: list[str],
+    image_urls: List[str],
     max_tokens: int,
 ) -> ORJSONResponse:
 
@@ -823,7 +823,7 @@ async def non_streaming_response(
     return ORJSONResponse(content.dict())
 
 
-async def rotate_token(tokens) -> tuple[AsyncPoeApi, bool]:
+async def rotate_token(tokens) -> Tuple[AsyncPoeApi, bool]:
     if len(tokens) == 0:
         raise HTTPException(
             detail={
