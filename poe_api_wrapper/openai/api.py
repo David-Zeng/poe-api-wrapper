@@ -51,6 +51,28 @@ with open(os.path.join(DIR, "models.json"), "rb") as f:
     app.state.models = models
 
 
+async def call_tools(messages, tools, tool_choice):
+    response = await message_handler(
+        "gpt4_o_mini", messages, 128000, tools, tool_choice
+    )
+    tool_calls = None
+    client, _ = await rotate_token(app.state.tokens)
+    async for chunk in client.send_message(
+        bot="gpt4_o_mini", message=response["message"]
+    ):
+        try:
+            res_list = orjson.loads(
+                chunk["text"].strip().replace("\n", "").replace("\\", "")
+            )
+            if res_list and type(res_list) == list:
+                tool_calls = res_list
+                break
+        except Exception as e:
+            pass
+
+    return tool_calls
+
+
 @app.get("/", response_model=None)
 async def index() -> ORJSONResponse:
     return ORJSONResponse(
@@ -120,12 +142,14 @@ async def list_models(request: Request, model: str = None) -> ORJSONResponse:
 async def chat_completions(
     request: Request, data: ChatData
 ) -> Union[StreamingResponse, ORJSONResponse]:
-    messages, model, streaming, max_tokens, stream_options = (
+    messages, model, streaming, max_tokens, stream_options, tools, tool_choice = (
         data.messages,
         data.model,
         data.stream,
         data.max_tokens,
         data.stream_options,
+        data.tools,
+        data.tool_choice,
     )
 
     # Validate messages format
@@ -147,6 +171,19 @@ async def chat_completions(
             detail={
                 "error": {
                     "message": "Invalid model.",
+                    "type": "error",
+                    "param": None,
+                    "code": 400,
+                }
+            },
+            status_code=400,
+        )
+
+    if tools and len(tools) > 20:
+        raise HTTPException(
+            detail={
+                "error": {
+                    "message": "Maximum 20 tools are allowed.",
                     "type": "error",
                     "param": None,
                     "code": 400,
@@ -201,20 +238,43 @@ async def chat_completions(
     prompt_tokens = await helpers.__tokenize(
         "".join([str(message) for message in response["message"]])
     )
-    if (
-        max_tokens
-        and sum((max_tokens, prompt_tokens)) > app.state.models[model]["tokens"]
-    ):
+
+    if prompt_tokens > tokensLimit:
         raise HTTPException(
             detail={
                 "error": {
-                    "message": f"This model's maximum context length is {app.state.models[model]['tokens']} tokens. However your request exceeds this limit ({max_tokens} in max_tokens, {prompt_tokens} in messages).",
+                    "message": f"Your prompt exceeds the maximum context length of {tokensLimit} tokens.",
                     "type": "error",
                     "param": None,
                     "code": 400,
                 }
             },
             status_code=400,
+        )
+
+    if max_tokens and sum((max_tokens, prompt_tokens)) > tokensLimit:
+        raise HTTPException(
+            detail={
+                "error": {
+                    "message": f"This model's maximum context length is {tokensLimit} tokens. However your request exceeds this limit ({max_tokens} in max_tokens, {prompt_tokens} in messages).",
+                    "type": "error",
+                    "param": None,
+                    "code": 400,
+                }
+            },
+            status_code=400,
+        )
+
+    raw_tool_calls = None
+    if tools:
+        if not tool_choice:
+            tool_choice = "auto"
+        raw_tool_calls = await call_tools(messages, tools, tool_choice)
+
+    if raw_tool_calls:
+        response = {"bot": "gpt4_o_mini", "message": ""}
+        prompt_tokens = await helpers.__tokenize(
+            "".join([str(message["content"]) for message in text_messages])
         )
 
     completion_id = await helpers.__generate_completion_id()
@@ -229,6 +289,7 @@ async def chat_completions(
             image_urls,
             max_tokens,
             include_usage,
+            raw_tool_calls,
         )
         if streaming
         else await non_streaming_response(
@@ -239,6 +300,7 @@ async def chat_completions(
             prompt_tokens,
             image_urls,
             max_tokens,
+            raw_tool_calls,
         )
     )
 
@@ -585,19 +647,41 @@ async def image_handler(baseModel: str, prompt: str, tokensLimit: int) -> dict:
 
 
 async def message_handler(
-    baseModel: str, messages: List[Dict[str, str]], tokensLimit: int
+    baseModel: str,
+    messages: List[Dict[str, str]],
+    tokensLimit: int,
+    tools: list[dict[str, str]] = None,
+    tool_choice=None,
 ) -> dict:
 
     try:
         main_request = messages[-1]["content"]
+        check_user = messages[::-1]
+        for message in check_user:
+            if message["role"] == "user":
+                main_request = message["content"]
+                break
 
-        rest_string = await helpers.__stringify_messages(messages=messages)
+        if tools:
+            rest_tools = await helpers.__convert_functions_format(tools, tool_choice)
+            if messages[0]["role"] == "system":
+                messages[0]["content"] += rest_tools
+            else:
+                messages.insert(0, {"role": "system", "content": rest_tools})
 
-        rest_string = await helpers.__progressive_summarize_text(
-            rest_string, min(len(rest_string), tokensLimit)
-        )
+        full_string = await helpers.__stringify_messages(messages=messages)
 
-        message = f"Your current message context: \n{rest_string}\n\nThe most recent message: {main_request}\n\n"
+        history_string = await helpers.__stringify_messages(messages=messages[:-1])
+
+        full_tokens = await helpers.__tokenize(full_string)
+
+        if full_tokens > tokensLimit:
+            history_string = await helpers.__progressive_summarize_text(
+                history_string,
+                tokensLimit - await helpers.__tokenize(main_request) - 100,
+            )
+
+        message = f"Your current message context: \n{history_string}\n\nReply to most recent message: {main_request}\n\n"
         return {"bot": baseModel, "message": message}
     except Exception as e:
         raise HTTPException(
@@ -640,25 +724,43 @@ async def generate_image(
 
 async def create_completion_data(
     completion_id: str,
+    created: int,
     model: str,
     chunk: str = None,
     finish_reason: str = None,
     include_usage: bool = False,
     prompt_tokens: int = 0,
     completion_tokens: int = 0,
+    raw_tool_calls: list[dict[str, str]] = None,
 ) -> Dict[str, Union[str, list, float]]:
-
-    completion_timestamp = await helpers.__generate_timestamp()
 
     completion_data = ChatCompletionChunk(
         id=f"chatcmpl-{completion_id}",
         object="chat.completion.chunk",
-        created=completion_timestamp,
+        created=created,
         model=model,
         choices=[
             ChatCompletionChunkChoice(
                 index=0,
-                delta=MessageResponse(role="assistant", content=chunk),
+                delta=MessageResponse(
+                    role="assistant",
+                    content=chunk,
+                    tool_calls=(
+                        [
+                            ChoiceDeltaToolCall(
+                                index=raw_tool_calls.index(tool_call),
+                                id=f"call-{await helpers.__generate_completion_id()}",
+                                function=ChoiceDeltaToolCallFunction(
+                                    name=tool_call["name"],
+                                    arguments=orjson.dumps(tool_call["arguments"]),
+                                ),
+                            )
+                            for tool_call in raw_tool_calls
+                        ]
+                        if raw_tool_calls
+                        else None
+                    ),
+                ),
                 finish_reason=finish_reason,
             )
         ],
@@ -673,7 +775,7 @@ async def create_completion_data(
                 total_tokens=prompt_tokens + completion_tokens,
             )
 
-    return completion_data.dict()
+    return completion_data.model_dump()
 
 
 async def generate_chunks(
@@ -685,40 +787,70 @@ async def generate_chunks(
     image_urls: List[str],
     max_tokens: int,
     include_usage: bool,
+    raw_tool_calls: list[dict[str, str]] = None,
 ) -> AsyncGenerator[bytes, None]:
 
     try:
+        completion_timestamp = await helpers.__generate_timestamp()
         finish_reason = "stop"
-        async for chunk in client.send_message(
-            bot=response["bot"], message=response["message"], file_path=image_urls
-        ):
-            chunk_token = await helpers.__tokenize(chunk["text"])
 
-            if max_tokens and chunk_token >= max_tokens:
-                await client.cancel_message(chunk)
-                finish_reason = "length"
-                break
+        if not raw_tool_calls:
+            async for chunk in client.send_message(
+                bot=response["bot"], message=response["message"], file_path=image_urls
+            ):
+                chunk_token = await helpers.__tokenize(chunk["text"])
 
-            content = await create_completion_data(
+                if max_tokens and chunk_token >= max_tokens:
+                    await client.cancel_message(chunk)
+                    finish_reason = "length"
+                    break
+
+                content = await create_completion_data(
+                    completion_id=completion_id,
+                    created=completion_timestamp,
+                    model=model,
+                    chunk=chunk["response"],
+                    include_usage=include_usage,
+                )
+
+                yield b"data: " + orjson.dumps(content) + b"\n\n"
+                await asyncio.sleep(0.001)
+
+            end_completion_data = await create_completion_data(
                 completion_id=completion_id,
+                created=completion_timestamp,
                 model=model,
-                chunk=chunk["response"],
+                finish_reason=finish_reason,
                 include_usage=include_usage,
+                prompt_tokens=prompt_tokens,
+                completion_tokens=chunk_token,
             )
 
+            yield b"data: " + orjson.dumps(end_completion_data) + b"\n\n"
+
+        else:
+            chunk_token = await helpers.__tokenize(
+                "".join(
+                    [
+                        str(tool_call["name"]) + str(tool_call["arguments"])
+                        for tool_call in raw_tool_calls
+                    ]
+                )
+            )
+            content = await create_completion_data(
+                completion_id=completion_id,
+                created=completion_timestamp,
+                model=model,
+                chunk=None,
+                finish_reason="tool_calls",
+                include_usage=include_usage,
+                prompt_tokens=prompt_tokens,
+                completion_tokens=chunk_token,
+                raw_tool_calls=raw_tool_calls,
+            )
             yield b"data: " + orjson.dumps(content) + b"\n\n"
-            await asyncio.sleep(0.001)
+            await asyncio.sleep(0.01)
 
-        end_completion_data = await create_completion_data(
-            completion_id=completion_id,
-            model=model,
-            finish_reason=finish_reason,
-            include_usage=include_usage,
-            prompt_tokens=prompt_tokens,
-            completion_tokens=chunk_token,
-        )
-
-        yield b"data: " + orjson.dumps(end_completion_data) + b"\n\n"
         yield b"data: [DONE]\n\n"
     except GeneratorExit:
         pass
@@ -745,6 +877,7 @@ async def streaming_response(
     image_urls: List[str],
     max_tokens: int,
     include_usage: bool,
+    raw_tool_calls: list[dict[str, str]] = None,
 ) -> StreamingResponse:
 
     return StreamingResponse(
@@ -757,6 +890,7 @@ async def streaming_response(
             image_urls,
             max_tokens,
             include_usage,
+            raw_tool_calls,
         ),
         status_code=200,
         headers={
@@ -774,32 +908,46 @@ async def non_streaming_response(
     prompt_tokens: int,
     image_urls: List[str],
     max_tokens: int,
+    raw_tool_calls: list[dict[str, str]] = None,
 ) -> ORJSONResponse:
 
-    try:
-        finish_reason = "stop"
-        async for chunk in client.send_message(
-            bot=response["bot"], message=response["message"], file_path=image_urls
-        ):
-            if max_tokens and await helpers.__tokenize(chunk["text"]) >= max_tokens:
-                await client.cancel_message(chunk)
-                finish_reason = "length"
-                break
-            pass
-    except Exception as e:
-        raise HTTPException(
-            detail={
-                "error": {
-                    "message": f"Failed to generate completion. Error: {e}",
-                    "type": "error",
-                    "param": None,
-                    "code": 500,
-                }
-            },
-            status_code=500,
-        ) from e
+    if not raw_tool_calls:
+        try:
+            finish_reason = "stop"
+            async for chunk in client.send_message(
+                bot=response["bot"], message=response["message"], file_path=image_urls
+            ):
+                if max_tokens and await helpers.__tokenize(chunk["text"]) >= max_tokens:
+                    await client.cancel_message(chunk)
+                    finish_reason = "length"
+                    break
+                pass
+        except Exception as e:
+            raise HTTPException(
+                detail={
+                    "error": {
+                        "message": f"Failed to generate completion. Error: {e}",
+                        "type": "error",
+                        "param": None,
+                        "code": 500,
+                    }
+                },
+                status_code=500,
+            ) from e
 
-    completion_tokens = await helpers.__tokenize(chunk["text"])
+        completion_tokens = await helpers.__tokenize(chunk["text"])
+
+    else:
+        completion_tokens = await helpers.__tokenize(
+            "".join(
+                [
+                    str(tool_call["name"]) + str(tool_call["arguments"])
+                    for tool_call in raw_tool_calls
+                ]
+            )
+        )
+        chunk = {"text": ""}
+        finish_reason = "tool_calls"
 
     content = ChatCompletionResponse(
         id=f"chatcmpl-{completion_id}",
@@ -814,13 +962,30 @@ async def non_streaming_response(
         choices=[
             ChatCompletionResponseChoice(
                 index=0,
-                message=MessageResponse(role="assistant", content=chunk["text"]),
+                message=MessageResponse(
+                    role="assistant",
+                    content=None if raw_tool_calls else chunk["text"],
+                    tool_calls=(
+                        [
+                            ChatCompletionMessageToolCall(
+                                id=f"call-{await helpers.__generate_completion_id()}",
+                                function=FunctionCall(
+                                    name=tool_call["name"],
+                                    arguments=orjson.dumps(tool_call["arguments"]),
+                                ),
+                            )
+                            for tool_call in raw_tool_calls
+                        ]
+                        if raw_tool_calls
+                        else None
+                    ),
+                ),
                 finish_reason=finish_reason,
             )
         ],
     )
 
-    return ORJSONResponse(content.dict())
+    return ORJSONResponse(content.model_dump())
 
 
 async def rotate_token(tokens) -> Tuple[AsyncPoeApi, bool]:
